@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
 import weakref
 from dataclasses import dataclass, replace
 from typing import Any
@@ -54,7 +53,7 @@ class _TTSOptions:
     chunk_length: int
     speed: NotGivenOr[float]
     volume: NotGivenOr[float]
-    prebuffer_ms: int
+    prebuffer_chunks: int
 
     def get_http_url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -77,7 +76,7 @@ class TTS(tts.TTS):
         chunk_length: int = 100,
         speed: NotGivenOr[float] = NOT_GIVEN,
         volume: NotGivenOr[float] = NOT_GIVEN,
-        prebuffer_ms: int = 200,
+        prebuffer_chunks: int = 2,
         tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
@@ -107,19 +106,18 @@ class TTS(tts.TTS):
             volume (NotGivenOr[float]): Loudness adjustment in decibels (Fish
                 ``prosody.volume``). ``0`` is the voice's natural level. Unset leaves it
                 unchanged.
-            prebuffer_ms (int): Wall-clock startup delay, in milliseconds of real
-                time, to hold synthesized audio before releasing the first audio to
-                the framework. Timed from the first audio event; audio keeps
-                accumulating until this much real time has elapsed, at which point the
-                buffer is released and the rest of the stream passes through. This
-                naturally waits for Fish's second (larger) chunk to arrive before
-                playout starts, giving the cold-start boundary enough headroom to
-                absorb Fish's initial chunk1→chunk2 pacing gap over WebRTC and avoid an
-                audible click/gap early in the first utterance. It is a real-time delay,
-                not an audio amount — Fish's first chunk alone is already ~460ms of
-                audio, so gating on audio duration would release immediately and add no
-                headroom. Only affects the streaming (WebSocket) path; ``0`` disables
-                it. Defaults to 200.
+            prebuffer_chunks (int): Number of audio chunks to accumulate at the start
+                of each stream before releasing any audio to the framework; the rest
+                of the stream then passes straight through. Fish sends a small first
+                chunk (~460ms) followed only ~250ms later by a much larger second
+                chunk, so starting WebRTC's real-time playout at the first chunk nearly
+                starves the buffer before the second arrives — jitter then turns that
+                into an audible click/gap early in the first utterance. Waiting for the
+                second chunk (the default, ``2``) starts playout with ~1.3s buffered,
+                which absorbs the gap. A client-side stopgap for Fish's bursty
+                cold-start pacing; the real fix is smoother server-side chunk delivery.
+                Only affects the streaming (WebSocket) path; ``0`` or ``1`` disables it.
+                Defaults to 2.
             tokenizer (tokenize.SentenceTokenizer): Sentence tokenizer used to detect
                 sentence boundaries. Defaults to ``tokenize.blingfire.SentenceTokenizer()``.
             http_session (aiohttp.ClientSession | None): Optional aiohttp session.
@@ -150,8 +148,8 @@ class TTS(tts.TTS):
         if not 100 <= chunk_length <= 300:
             raise ValueError("chunk_length must be between 100 and 300")
 
-        if prebuffer_ms < 0:
-            raise ValueError("prebuffer_ms must be >= 0")
+        if prebuffer_chunks < 0:
+            raise ValueError("prebuffer_chunks must be >= 0")
 
         self._opts = _TTSOptions(
             model=model,
@@ -164,7 +162,7 @@ class TTS(tts.TTS):
             chunk_length=chunk_length,
             speed=speed,
             volume=volume,
-            prebuffer_ms=prebuffer_ms,
+            prebuffer_chunks=prebuffer_chunks,
         )
 
         self._session = http_session
@@ -454,35 +452,33 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             await ws.send_bytes(msgpack.packb({"event": "stop"}, use_bin_type=True))
 
-        # Startup prebuffer: hold audio for the first `prebuffer_ms` of WALL-CLOCK
-        # time before pushing anything to the output emitter, then pass through for
-        # the rest of the stream. WebRTC starts playout at the first chunk on a strict
-        # real-time clock, so releasing the first audio too eagerly leaves almost no
-        # headroom when Fish's second (much larger) chunk lands ~250ms later — jitter
-        # starves the pipeline and the receiver conceals it as a click/gap. The gate
-        # is deliberately a real-time delay, not an audio amount: Fish's first chunk
-        # alone is already ~460ms of audio, so a duration threshold would release
-        # immediately and add zero headroom. Timing from the first audio event, we
-        # keep accumulating until `prebuffer_ms` of real time has elapsed — which lines
-        # up with chunk 2 arriving — then release the accumulated buffer at once. The
-        # check is driven by audio-event arrivals (no timer needed): release happens on
-        # the first event at or after the deadline.
+        # Startup prebuffer: hold the first `prebuffer_chunks` audio chunks before
+        # releasing any audio to the framework, then pass everything else straight
+        # through. Fish delivers a small first chunk (~460ms of audio) and then, only
+        # ~250ms later, a much larger second chunk. WebRTC starts playout at the first
+        # chunk on a strict real-time clock, so if we release chunk 1 immediately the
+        # buffer nearly drains before chunk 2 arrives; any jitter tips it into an
+        # underrun that the receiver conceals as an audible click/gap ~0.5s into the
+        # first utterance. Waiting for the second chunk means playout starts with
+        # chunk 1 + chunk 2 buffered (~1.3s), which comfortably absorbs the gap.
         #
-        # This state is LOCAL to _run_ws so it resets per synthesis even though the
-        # socket is reused across syntheses via the pool.
-        prebuffer_ms = self._opts.prebuffer_ms
+        # This is a client-side STOPGAP for Fish's bursty cold-start pacing; the real
+        # fix is smoother chunk delivery from the TTS server (a larger or earlier
+        # second chunk), after which this can be reduced or removed.
+        #
+        # State is LOCAL to _run_ws so it resets per synthesis even though the socket
+        # is reused across syntheses via the pool.
+        prebuffer_chunks = self._opts.prebuffer_chunks
         prebuffer = bytearray()
-        prebuffering = prebuffer_ms > 0
-        deadline: float | None = None
+        chunks_seen = 0
+        prebuffering = prebuffer_chunks > 1
 
         def push_audio(audio: bytes) -> None:
-            nonlocal prebuffering, deadline
+            nonlocal prebuffering, chunks_seen
             if prebuffering:
-                now = time.monotonic()
-                if deadline is None:
-                    deadline = now + prebuffer_ms / 1000
                 prebuffer.extend(audio)
-                if now < deadline:
+                chunks_seen += 1
+                if chunks_seen < prebuffer_chunks:
                     return
                 output_emitter.push(bytes(prebuffer))
                 prebuffer.clear()
@@ -491,8 +487,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                 output_emitter.push(audio)
 
         def flush_prebuffer() -> None:
-            # End of segment: release any audio still held (deadline not yet reached)
-            # so a short utterance is never dropped or left hanging.
+            # Stream ended before we reached `prebuffer_chunks` (short utterance) —
+            # release whatever is held so nothing is dropped or left hanging.
             nonlocal prebuffering
             if prebuffering and prebuffer:
                 output_emitter.push(bytes(prebuffer))
