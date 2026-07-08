@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import weakref
 from dataclasses import dataclass, replace
 from typing import Any
@@ -53,6 +54,7 @@ class _TTSOptions:
     chunk_length: int
     speed: NotGivenOr[float]
     volume: NotGivenOr[float]
+    prebuffer_ms: int
 
     def get_http_url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -75,6 +77,7 @@ class TTS(tts.TTS):
         chunk_length: int = 100,
         speed: NotGivenOr[float] = NOT_GIVEN,
         volume: NotGivenOr[float] = NOT_GIVEN,
+        prebuffer_ms: int = 200,
         tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
@@ -104,6 +107,19 @@ class TTS(tts.TTS):
             volume (NotGivenOr[float]): Loudness adjustment in decibels (Fish
                 ``prosody.volume``). ``0`` is the voice's natural level. Unset leaves it
                 unchanged.
+            prebuffer_ms (int): Wall-clock startup delay, in milliseconds of real
+                time, to hold synthesized audio before releasing the first audio to
+                the framework. Timed from the first audio event; audio keeps
+                accumulating until this much real time has elapsed, at which point the
+                buffer is released and the rest of the stream passes through. This
+                naturally waits for Fish's second (larger) chunk to arrive before
+                playout starts, giving the cold-start boundary enough headroom to
+                absorb Fish's initial chunk1→chunk2 pacing gap over WebRTC and avoid an
+                audible click/gap early in the first utterance. It is a real-time delay,
+                not an audio amount — Fish's first chunk alone is already ~460ms of
+                audio, so gating on audio duration would release immediately and add no
+                headroom. Only affects the streaming (WebSocket) path; ``0`` disables
+                it. Defaults to 200.
             tokenizer (tokenize.SentenceTokenizer): Sentence tokenizer used to detect
                 sentence boundaries. Defaults to ``tokenize.blingfire.SentenceTokenizer()``.
             http_session (aiohttp.ClientSession | None): Optional aiohttp session.
@@ -134,6 +150,9 @@ class TTS(tts.TTS):
         if not 100 <= chunk_length <= 300:
             raise ValueError("chunk_length must be between 100 and 300")
 
+        if prebuffer_ms < 0:
+            raise ValueError("prebuffer_ms must be >= 0")
+
         self._opts = _TTSOptions(
             model=model,
             output_format=output_format,
@@ -145,9 +164,16 @@ class TTS(tts.TTS):
             chunk_length=chunk_length,
             speed=speed,
             volume=volume,
+            prebuffer_ms=prebuffer_ms,
         )
 
         self._session = http_session
+        self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
+            connect_cb=self._connect_ws,
+            close_cb=self._close_ws,
+            max_session_duration=300,
+            mark_refreshed_on_get=True,
+        )
         # min_sentence_len=1 emits each sentence as soon as the next one starts,
         # rather than batching short sentences together — minimizes TTFB on the
         # first sentence and keeps Fish synthesizing continuously.
@@ -189,6 +215,27 @@ class TTS(tts.TTS):
         if not self._session:
             self._session = utils.http_context.http_session()
         return self._session
+
+    async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
+        session = self._ensure_session()
+        return await asyncio.wait_for(
+            session.ws_connect(
+                self._opts.get_ws_url("/v1/tts/live"),
+                headers={
+                    "Authorization": f"Bearer {self._opts.api_key}",
+                    "User-Agent": USER_AGENT,
+                    "model": self._opts.model,
+                },
+                heartbeat=30.0,
+            ),
+            timeout,
+        )
+
+    async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        await ws.close()
+
+    def prewarm(self) -> None:
+        self._pool.prewarm()
 
     def update_options(
         self,
@@ -236,6 +283,7 @@ class TTS(tts.TTS):
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        await self._pool.aclose()
 
 
 def _build_tts_request(opts: _TTSOptions, *, text: str = "") -> dict[str, Any]:
@@ -339,22 +387,14 @@ class SynthesizeStream(tts.SynthesizeStream):
         )
         output_emitter.start_segment(segment_id=request_id)
 
-        ws: aiohttp.ClientWebSocketResponse | None = None
         try:
-            ws = await asyncio.wait_for(
-                self._tts._ensure_session().ws_connect(
-                    self._opts.get_ws_url("/v1/tts/live"),
-                    headers={
-                        "Authorization": f"Bearer {self._opts.api_key}",
-                        "User-Agent": USER_AGENT,
-                        "model": self._opts.model,
-                    },
-                    heartbeat=30.0,
-                ),
-                self._conn_options.timeout,
-            )
-
-            await self._run_ws(ws, output_emitter)
+            # Reuse a persistent, pre-warmed socket from the pool instead of opening a
+            # fresh WSS per utterance (which paid ~330ms of TLS+WS handshake on every
+            # reply). Each synthesis still sends its own `start`/.../`stop` on the
+            # shared socket; returning from this block hands the socket back to the
+            # pool for the next utterance rather than closing it.
+            async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
+                await self._run_ws(ws, output_emitter)
 
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
@@ -367,8 +407,6 @@ class SynthesizeStream(tts.SynthesizeStream):
         except Exception as e:
             raise APIConnectionError() from e
         finally:
-            if ws is not None:
-                await ws.close()
             output_emitter.end_segment()
 
     async def _run_ws(
@@ -416,6 +454,51 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             await ws.send_bytes(msgpack.packb({"event": "stop"}, use_bin_type=True))
 
+        # Startup prebuffer: hold audio for the first `prebuffer_ms` of WALL-CLOCK
+        # time before pushing anything to the output emitter, then pass through for
+        # the rest of the stream. WebRTC starts playout at the first chunk on a strict
+        # real-time clock, so releasing the first audio too eagerly leaves almost no
+        # headroom when Fish's second (much larger) chunk lands ~250ms later — jitter
+        # starves the pipeline and the receiver conceals it as a click/gap. The gate
+        # is deliberately a real-time delay, not an audio amount: Fish's first chunk
+        # alone is already ~460ms of audio, so a duration threshold would release
+        # immediately and add zero headroom. Timing from the first audio event, we
+        # keep accumulating until `prebuffer_ms` of real time has elapsed — which lines
+        # up with chunk 2 arriving — then release the accumulated buffer at once. The
+        # check is driven by audio-event arrivals (no timer needed): release happens on
+        # the first event at or after the deadline.
+        #
+        # This state is LOCAL to _run_ws so it resets per synthesis even though the
+        # socket is reused across syntheses via the pool.
+        prebuffer_ms = self._opts.prebuffer_ms
+        prebuffer = bytearray()
+        prebuffering = prebuffer_ms > 0
+        deadline: float | None = None
+
+        def push_audio(audio: bytes) -> None:
+            nonlocal prebuffering, deadline
+            if prebuffering:
+                now = time.monotonic()
+                if deadline is None:
+                    deadline = now + prebuffer_ms / 1000
+                prebuffer.extend(audio)
+                if now < deadline:
+                    return
+                output_emitter.push(bytes(prebuffer))
+                prebuffer.clear()
+                prebuffering = False
+            else:
+                output_emitter.push(audio)
+
+        def flush_prebuffer() -> None:
+            # End of segment: release any audio still held (deadline not yet reached)
+            # so a short utterance is never dropped or left hanging.
+            nonlocal prebuffering
+            if prebuffering and prebuffer:
+                output_emitter.push(bytes(prebuffer))
+                prebuffer.clear()
+            prebuffering = False
+
         async def recv_task() -> None:
             # No per-receive timeout: Fish has natural inter-sentence gaps that
             # can exceed `_conn_options.timeout` when the LLM is slow. Dead
@@ -443,7 +526,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if event == "audio":
                     audio = data.get("audio")
                     if audio:
-                        output_emitter.push(audio)
+                        push_audio(audio)
                 elif event == "finish":
                     reason = data.get("reason")
                     if reason == "error":
@@ -453,6 +536,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                             request_id=None,
                             body=str(data),
                         )
+                    flush_prebuffer()
                     break
                 else:
                     logger.debug("unknown Fish Audio event: %s", data)
