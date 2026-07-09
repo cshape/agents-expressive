@@ -31,6 +31,12 @@ DEFAULT_BASE_URL = "https://api.fish.audio"
 NUM_CHANNELS = 1
 USER_AGENT = f"livekit-plugins-fishaudio/{__version__}"
 
+# Hold the first N audio chunks before releasing any audio, so playout starts with
+# enough buffered to ride out the gap after Fish's small first chunk (else jitter
+# underruns it into a crackle). Internal stopgap for Fish's cold-start pacing; drop
+# to 1 once inference streams the opening chunks smoothly. Values <= 1 disable it.
+_PREBUFFER_CHUNKS = 2
+
 # Fish Audio's default sample rate per output format. Opus only supports 48 kHz;
 # the other formats default to 24 kHz, which matches the previous plugin default.
 _DEFAULT_SAMPLE_RATE: dict[OutputFormat, int] = {
@@ -53,7 +59,6 @@ class _TTSOptions:
     chunk_length: int
     speed: NotGivenOr[float]
     volume: NotGivenOr[float]
-    prebuffer_chunks: int
 
     def get_http_url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -76,7 +81,6 @@ class TTS(tts.TTS):
         chunk_length: int = 100,
         speed: NotGivenOr[float] = NOT_GIVEN,
         volume: NotGivenOr[float] = NOT_GIVEN,
-        prebuffer_chunks: int = 2,
         tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
@@ -106,18 +110,6 @@ class TTS(tts.TTS):
             volume (NotGivenOr[float]): Loudness adjustment in decibels (Fish
                 ``prosody.volume``). ``0`` is the voice's natural level. Unset leaves it
                 unchanged.
-            prebuffer_chunks (int): Number of audio chunks to accumulate at the start
-                of each stream before releasing any audio to the framework; the rest
-                of the stream then passes straight through. Fish sends a small first
-                chunk (~460ms) followed only ~250ms later by a much larger second
-                chunk, so starting WebRTC's real-time playout at the first chunk nearly
-                starves the buffer before the second arrives — jitter then turns that
-                into an audible click/gap early in the first utterance. Waiting for the
-                second chunk (the default, ``2``) starts playout with ~1.3s buffered,
-                which absorbs the gap. A client-side stopgap for Fish's bursty
-                cold-start pacing; the real fix is smoother server-side chunk delivery.
-                Only affects the streaming (WebSocket) path; ``0`` or ``1`` disables it.
-                Defaults to 2.
             tokenizer (tokenize.SentenceTokenizer): Sentence tokenizer used to detect
                 sentence boundaries. Defaults to ``tokenize.blingfire.SentenceTokenizer()``.
             http_session (aiohttp.ClientSession | None): Optional aiohttp session.
@@ -148,9 +140,6 @@ class TTS(tts.TTS):
         if not 100 <= chunk_length <= 300:
             raise ValueError("chunk_length must be between 100 and 300")
 
-        if prebuffer_chunks < 0:
-            raise ValueError("prebuffer_chunks must be >= 0")
-
         self._opts = _TTSOptions(
             model=model,
             output_format=output_format,
@@ -162,7 +151,6 @@ class TTS(tts.TTS):
             chunk_length=chunk_length,
             speed=speed,
             volume=volume,
-            prebuffer_chunks=prebuffer_chunks,
         )
 
         self._session = http_session
@@ -245,8 +233,13 @@ class TTS(tts.TTS):
         speed: NotGivenOr[float] = NOT_GIVEN,
         volume: NotGivenOr[float] = NOT_GIVEN,
     ) -> None:
-        if is_given(model):
+        if is_given(model) and model != self._opts.model:
             self._opts.model = model
+            # The model is sent as a connection header at ws-handshake time, not in the
+            # per-request body, so a pooled socket keeps the old model. Drop pooled
+            # connections so the next stream reconnects with the new model. Other
+            # options ride in the per-request body and need no reconnect.
+            self._pool.invalidate()
         if is_given(voice_id):
             self._opts.voice_id = voice_id
         if is_given(latency_mode):
@@ -386,11 +379,6 @@ class SynthesizeStream(tts.SynthesizeStream):
         output_emitter.start_segment(segment_id=request_id)
 
         try:
-            # Reuse a persistent, pre-warmed socket from the pool instead of opening a
-            # fresh WSS per utterance (which paid ~330ms of TLS+WS handshake on every
-            # reply). Each synthesis still sends its own `start`/.../`stop` on the
-            # shared socket; returning from this block hands the socket back to the
-            # pool for the next utterance rather than closing it.
             async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
                 await self._run_ws(ws, output_emitter)
 
@@ -452,23 +440,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             await ws.send_bytes(msgpack.packb({"event": "stop"}, use_bin_type=True))
 
-        # Startup prebuffer: hold the first `prebuffer_chunks` audio chunks before
-        # releasing any audio to the framework, then pass everything else straight
-        # through. Fish delivers a small first chunk (~460ms of audio) and then, only
-        # ~250ms later, a much larger second chunk. WebRTC starts playout at the first
-        # chunk on a strict real-time clock, so if we release chunk 1 immediately the
-        # buffer nearly drains before chunk 2 arrives; any jitter tips it into an
-        # underrun that the receiver conceals as an audible click/gap ~0.5s into the
-        # first utterance. Waiting for the second chunk means playout starts with
-        # chunk 1 + chunk 2 buffered (~1.3s), which comfortably absorbs the gap.
-        #
-        # This is a client-side STOPGAP for Fish's bursty cold-start pacing; the real
-        # fix is smoother chunk delivery from the TTS server (a larger or earlier
-        # second chunk), after which this can be reduced or removed.
-        #
-        # State is LOCAL to _run_ws so it resets per synthesis even though the socket
-        # is reused across syntheses via the pool.
-        prebuffer_chunks = self._opts.prebuffer_chunks
+        prebuffer_chunks = _PREBUFFER_CHUNKS
         prebuffer = bytearray()
         chunks_seen = 0
         prebuffering = prebuffer_chunks > 1
