@@ -35,7 +35,7 @@ USER_AGENT = f"livekit-plugins-fishaudio/{__version__}"
 # enough buffered to ride out the gap after Fish's small first chunk (else jitter
 # underruns it into a crackle). Internal stopgap for Fish's cold-start pacing; drop
 # to 1 once inference streams the opening chunks smoothly. Values <= 1 disable it.
-_PREBUFFER_CHUNKS = 2
+_PREBUFFER_CHUNKS = 1
 
 # Fish Audio's default sample rate per output format. Opus only supports 48 kHz;
 # the other formats default to 24 kHz, which matches the previous plugin default.
