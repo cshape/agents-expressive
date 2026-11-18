@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "livekit-plugins-fishaudio"
 dynamic = ["version"]
-description = "Agent Framework plugin for voice synthesis and speech recognition with Fish Audio's API."
+description = "Agent Framework plugin for voice synthesis, speech recognition and realtime conversation with Fish Audio's API."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10.0"

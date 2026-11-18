@@ -8,6 +8,7 @@ Environment variables used:
 
 from livekit.agents import Plugin
 
+from . import realtime
 from .log import logger
 from .models import (
     LatencyMode,
@@ -33,6 +34,7 @@ __all__ = [
     "LatencyMode",
     "MP3Bitrate",
     "OpusBitrate",
+    "realtime",
     "__version__",
 ]
 

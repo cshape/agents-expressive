@@ -61,3 +61,20 @@ session = AgentSession(
     # ... llm, tts, etc.
 )
 ```
+
+### Realtime (Duplex API)
+
+`fishaudio.realtime.RealtimeModel` runs a conversation on Fish Audio's [Duplex API](https://docs.fish.audio/features/duplex-api), which is in preview. Fish Audio listens, detects turns and interruptions, and speaks. The `llm` you pass writes the replies, so instructions, chat context and tools work as with any LLM:
+
+```python
+from livekit.agents import AgentSession
+from livekit.plugins import fishaudio
+
+session = AgentSession(
+    llm=fishaudio.realtime.RealtimeModel(
+        llm="google/gemma-4-31b-it",  # a LiveKit Inference model, or any llm.LLM
+    ),
+)
+```
+
+No `stt`, `tts`, `vad` or turn detector is needed. Fish Audio decides what interrupts the agent, and only the text the user heard is kept in the chat context.
