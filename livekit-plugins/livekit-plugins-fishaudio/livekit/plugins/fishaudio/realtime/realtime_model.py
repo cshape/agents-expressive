@@ -27,6 +27,7 @@ from livekit.agents.metrics import RealtimeModelMetrics
 from livekit.agents.metrics.base import Metadata
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
+from livekit.agents.voice.generation import remove_instructions
 
 from ..log import logger
 from ..tts import DEFAULT_BASE_URL, USER_AGENT
@@ -40,14 +41,21 @@ _DUPLEX_PATH = "/v1/duplex/converse"
 # Caller audio is the session clock: Fish expects a frame every 20 ms, silence included.
 _FRAME_MS = 20
 _FRAME_BYTES = SAMPLE_RATE * 2 * _FRAME_MS // 1000
-# Old caller audio is worse than dropped caller audio.
-_MAX_INPUT_BUFFER_BYTES = SAMPLE_RATE * 2
+# Old caller audio is worse than dropped caller audio: Fish Audio hears the caller this late.
+_MAX_INPUT_BUFFER_BYTES = SAMPLE_RATE * 2 * 300 // 1000
 # Fish streams speech at playback pace in bursts, so playout starts behind this much silence.
 _JITTER_BUFFER_MS = 200
 # After this long without a forwarded frame the playout queue has drained.
 _PLAYOUT_IDLE = 0.25
 # Sound the voice makes between replies ends after this much silence.
 _AMBIENT_SILENCE_MS = 300
+# A pause inside a reply is played up to this long; a longer one, and the silence after the
+# last word, would only hold the playout back.
+_MAX_PAUSE_MS = 300
+# The voice's own sound stays muted for a tool call at most this long.
+_AMBIENT_MUTE_TIMEOUT = 5.0
+# The framework records a turn within moments; until then a context update may lack it.
+_UNACKED_ITEM_TTL = 5.0
 # Sound that has to make way for a tool call fades out over this long.
 _FADE_OUT_MS = 30
 # A reply the caller cut can be picked up again this long after it stopped.
@@ -110,10 +118,11 @@ class _Reply:
     """How much of the heard text the framework has been given."""
     has_audio: bool = False
     first_audio_at: float | None = None
-    held_silence: list[bytes] = field(default_factory=list)
-    """Silent frames after the last sound, played only if more sound follows."""
+    silence_ms: float = 0.0
+    """Silence forwarded since the last sound."""
     held_calls: list[llm.FunctionCall] = field(default_factory=list)
-    """Tool calls waiting for ``turn.committed``; a speculative reply must not run tools."""
+    """Tool calls waiting for ``turn.committed``, or written after the reply was cut; a
+    speculative reply must not run tools, and a cut one only if it is picked up again."""
     llm_task: asyncio.Task[None] | None = None
     usage: llm.CompletionUsage | None = None
     fut: asyncio.Future[llm.GenerationCreatedEvent] | None = None
@@ -282,12 +291,16 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._tool_choice: llm.ToolChoice | None = None
         self._instructions: str | None = None
         self._chat_ctx = llm.ChatContext.empty()
-        # items this session added that the framework has not sent back yet
-        self._unacked_item_ids: set[str] = set()
+        # items this session added a moment ago, and when: the framework may not have them yet
+        self._unacked_items: dict[str, float] = {}
 
         self._connected = False
         # whether the last connection attempt got as far as session.started
         self._was_connected = False
+        self._reconnecting = False
+        self._retries = 0
+        # the connection could not be restored; nothing more can be said
+        self._failed = False
         self._closing = False
         self._session_id: str | None = None
         self._text_rules: dict[str, Any] = {}
@@ -299,18 +312,22 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
 
         self._input_buf = bytearray()
         self._input_resampler: rtc.AudioResampler | None = None
+        self._input_rate = SAMPLE_RATE
 
         self._replies: dict[str, _Reply] = {}
         self._speculative: _Reply | None = None
         self._ambient: _Reply | None = None
         self._ambient_silence_ms = 0.0
-        # a tool call is waiting for the floor, so the voice's own sound is not played
-        self._ambient_muted = False
+        # a tool call is waiting for the floor since then, so the voice's own sound is not played
+        self._ambient_muted_at: float | None = None
         self._last_forward_at = 0.0
 
         self._conn_tag = utils.shortuuid("")
         self._turn_started_at: dict[str, float] = {}
         self._cut: _Cut | None = None
+        # the cut being picked up again, while its LLM finishes writing
+        self._resuming: _Cut | None = None
+        self._resume_atask: asyncio.Task[None] | None = None
         self._held_asides: list[tuple[str, float]] = []
         self._last_backchannel = ""
         self._caller_heard_at: float | None = None
@@ -339,24 +356,28 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         incoming = chat_ctx.copy(
-            exclude_instructions=True,
             exclude_empty_message=True,
             exclude_handoff=True,
             exclude_config_update=True,
         )
+        # the instructions arrive through update_instructions; other system messages stay
+        remove_instructions(incoming)
         incoming_ids = set()
         for item in incoming.items:
             incoming_ids.add(item.id)
 
-        # the framework records the agent's speech once it has played, which can be after
-        # this update was built: what this session added since stays until it comes back
+        # the framework records a turn a moment after it happens, which can be after this
+        # update was built: what this session added just now stays
+        now = time.time()
         kept: list[llm.ChatItem] = []
         for item in self._chat_ctx.items:
-            if item.id in incoming_ids:
-                self._unacked_item_ids.discard(item.id)
+            added_at = self._unacked_items.get(item.id)
+            if added_at is None:
                 continue
-            if item.id in self._unacked_item_ids:
-                kept.append(item)
+            if item.id in incoming_ids or now - added_at > _UNACKED_ITEM_TTL:
+                del self._unacked_items[item.id]
+                continue
+            kept.append(item)
 
         self._chat_ctx = incoming
         for item in kept:
@@ -391,7 +412,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN,
     ) -> asyncio.Future[llm.GenerationCreatedEvent]:
         fut: asyncio.Future[llm.GenerationCreatedEvent] = asyncio.Future()
-        if self._closing:
+        if self._closing or self._failed:
             fut.set_exception(llm.RealtimeError("the session is closed"))
             return fut
 
@@ -408,7 +429,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
 
     def say(self, text: str | AsyncIterable[str]) -> asyncio.Future[llm.GenerationCreatedEvent]:
         fut: asyncio.Future[llm.GenerationCreatedEvent] = asyncio.Future()
-        if self._closing:
+        if self._closing or self._failed:
             fut.set_exception(llm.RealtimeError("the session is closed"))
             return fut
 
@@ -422,14 +443,14 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         pass  # caller audio is consumed continuously, there is no buffer to commit
 
     def clear_audio(self) -> None:
-        pass
+        self._input_buf.clear()
 
     def interrupt(self) -> None:
         # a speculative reply is not the framework's to stop: it has not been told of it
         for reply in list(self._replies.values()):
             if reply.exposed and not reply.done and not reply.ambient:
                 self._cancel_reply(reply)
-        self._cut = None
+        self._drop_cut()
 
     def truncate(
         self,
@@ -457,29 +478,35 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
     @utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
         conn_options = self._opts.conn_options
-        retries = 0
         while not self._closing:
             try:
                 await self._run_connection()
-                retries = 0
             except Exception as e:
                 retryable = not isinstance(e, APIError) or e.retryable
-                recoverable = retryable and retries < conn_options.max_retry
+                recoverable = retryable and self._retries < conn_options.max_retry
                 self._emit_error(e, recoverable=recoverable)
+
+                if self._was_connected:
+                    # replies in flight died with the connection; the conversation itself
+                    # is ours, so the next connection carries on from it
+                    self._was_connected = False
+                    self._reconnecting = True
+                    self._reset_replies("the connection to Fish Audio was lost")
+
                 if not recoverable:
+                    self._failed = True
                     self._reset_replies("the connection to Fish Audio failed")
                     return
-                retries += 1
-                await asyncio.sleep(conn_options.retry_interval)
 
-            if self._closing:
-                return
-
-            if self._was_connected:
-                # replies in flight died with the connection; the conversation itself is ours
-                self._was_connected = False
-                self._reset_replies("the connection to Fish Audio was lost")
-                self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
+                retry_interval = conn_options._interval_for_retry(self._retries)
+                self._retries += 1
+                logger.warning(
+                    "Fish Audio connection failed, retrying in %.1fs",
+                    retry_interval,
+                    exc_info=e,
+                    extra={"attempt": self._retries, "max_retries": conn_options.max_retry},
+                )
+                await asyncio.sleep(retry_interval)
 
     async def _run_connection(self) -> None:
         connect_started_at = time.perf_counter()
@@ -514,6 +541,17 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
                     delay = 0
                 await asyncio.sleep(max(delay, 0))
 
+        async def _started_task() -> None:
+            # a server that accepts the socket and then says nothing is not a session
+            timeout = self._opts.conn_options.timeout
+            waited = 0.0
+            while not self._connected:
+                if waited >= timeout:
+                    raise APIConnectionError("Fish Audio did not start the session in time")
+                await asyncio.sleep(0.1)
+                waited += 0.1
+            await asyncio.Future()
+
         async def _recv_task() -> None:
             while True:
                 msg = await ws.receive()
@@ -523,7 +561,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
                     aiohttp.WSMsgType.CLOSING,
                 ):
                     detail = self._last_error or "no error reported"
-                    if ws.close_code == _INVALID_REQUEST_CLOSE_CODE or not self._connected:
+                    if ws.close_code == _INVALID_REQUEST_CLOSE_CODE:
                         raise APIStatusError(
                             f"Fish Audio refused the session: {detail}",
                             status_code=ws.close_code or -1,
@@ -551,6 +589,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             asyncio.create_task(_send_task(), name="fishaudio-realtime-send"),
             asyncio.create_task(_pump_task(), name="fishaudio-realtime-pump"),
             asyncio.create_task(_recv_task(), name="fishaudio-realtime-recv"),
+            asyncio.create_task(_started_task(), name="fishaudio-realtime-started"),
         ]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -632,14 +671,17 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
     # -- audio -------------------------------------------------------------------------
 
     def _resample_audio(self, frame: rtc.AudioFrame) -> list[rtc.AudioFrame]:
-        if frame.sample_rate == SAMPLE_RATE and frame.num_channels == NUM_CHANNELS:
+        if frame.num_channels != NUM_CHANNELS:
+            frame = _to_mono(frame)
+        if frame.sample_rate == SAMPLE_RATE:
             return [frame]
 
-        if self._input_resampler is None:
+        if self._input_resampler is None or self._input_rate != frame.sample_rate:
+            self._input_rate = frame.sample_rate
             self._input_resampler = rtc.AudioResampler(
                 input_rate=frame.sample_rate,
                 output_rate=SAMPLE_RATE,
-                num_channels=frame.num_channels,
+                num_channels=NUM_CHANNELS,
             )
         return self._input_resampler.push(frame)
 
@@ -667,19 +709,19 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             if owner.closed:
                 # the framework stopped this reply; what is left of its sound is not played
                 return
-            if silent:
-                # a pause is played only if speech follows it, so a reply ends with its speech
-                if owner.has_audio:
-                    owner.held_silence.append(data)
+            if not silent:
+                owner.silence_ms = 0.0
+                self._forward_audio(owner, data)
                 return
-            for held in owner.held_silence:
-                self._forward_audio(owner, held)
-            owner.held_silence = []
-            self._forward_audio(owner, data)
+            # a short pause is played as it comes; the rest of a long one, and the silence
+            # after the last word, would only keep the playout busy
+            if owner.has_audio and owner.silence_ms < _MAX_PAUSE_MS:
+                owner.silence_ms += duration_ms
+                self._forward_audio(owner, data)
             return
 
         ambient = self._ambient
-        if self._ambient_muted:
+        if self._ambient_muted():
             # a generation plays one after another, and the tool call is behind this one
             if ambient is not None:
                 if not silent:
@@ -721,6 +763,15 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             reply.first_audio_at = time.time()
         reply.audio_ch.send_nowait(_audio_frame(data))
 
+    def _ambient_muted(self) -> bool:
+        muted_at = self._ambient_muted_at
+        if muted_at is None:
+            return False
+        if time.time() - muted_at > _AMBIENT_MUTE_TIMEOUT:
+            self._ambient_muted_at = None
+            return False
+        return True
+
     def _close_ambient(self) -> None:
         ambient = self._ambient
         if ambient is None:
@@ -742,9 +793,10 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         elif event_type == "turn.speech_started":
             self._turn_started_at[str(event.get("turn_id"))] = time.time()
             self._caller_heard_at = time.time()
-            self._ambient_muted = False
+            self._ambient_muted_at = None
             self.emit("input_speech_started", llm.InputSpeechStartedEvent())
         elif event_type == "turn.speech_ended":
+            self._turn_started_at.pop(str(event.get("turn_id")), None)
             self.emit(
                 "input_speech_stopped",
                 llm.InputSpeechStoppedEvent(user_transcription_enabled=True),
@@ -779,6 +831,12 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._max_text_bytes = int(limits.get("max_text_bytes") or _DEFAULT_MAX_TEXT_BYTES)
         self._connected = True
         self._was_connected = True
+        self._retries = 0
+        # what the caller said while there was no session is not said to this one
+        self._input_buf.clear()
+        if self._reconnecting:
+            self._reconnecting = False
+            self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
 
         pending = self._pending_frames
         self._pending_frames = []
@@ -789,6 +847,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._last_error = f"{event.get('code')}: {event.get('message')}"
         if event.get("recoverable"):
             logger.warning("Fish Audio reported an error", extra={"error": self._last_error})
+            self._emit_error(APIError(f"Fish Audio error: {self._last_error}"), recoverable=True)
             return
         # the server closes the session next, and the close is what gets reported
 
@@ -835,15 +894,21 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         text = str(event.get("text") or "").strip()
         self._caller_heard_at = None
         if not text:
+            # nothing was said after all, as with a dropped turn
             self._cancel_speculative()
+            self._resume_cut()
             return
 
         if event.get("kind") == "aside":
             self._on_aside(text)
             return
 
-        # a real turn: the reply it cut is not picked up again
-        self._cut = None
+        # a real turn: the reply it cut is not picked up again, and a reply still being
+        # written for an earlier turn would answer without it
+        self._drop_cut()
+        for reply in list(self._replies.values()):
+            if reply.exposed and not reply.done and not reply.ambient:
+                self._cancel_reply(reply)
         self._take_held_asides()
         self._add_user_turn(self._item_id(turn_id), text, self._turn_started_at.pop(turn_id, None))
 
@@ -880,9 +945,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
 
     def _on_turn_dropped(self, event: dict[str, Any]) -> None:
         self._caller_heard_at = None
-        if self._cut is None:
-            return
-        # the sound that stopped the reply was not a turn
+        # the sound was not a turn: nothing answers it, and a reply it stopped carries on
         self._cancel_speculative()
         self._resume_cut()
 
@@ -891,7 +954,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         if reply is None:
             return
         reply.started = True
-        self._ambient_muted = False
+        self._ambient_muted_at = None
 
     def _on_reply_progress(self, event: dict[str, Any]) -> None:
         reply = self._replies.get(str(event.get("reply_id")))
@@ -1033,7 +1096,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._insert_item(call)
         reply.function_ch.send_nowait(call)
         if not reply.sent_first:
-            self._ambient_muted = True
+            self._ambient_muted_at = time.time()
 
     def _maybe_close(self, reply: _Reply) -> None:
         """Close the generation once nothing more can come of it."""
@@ -1093,8 +1156,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._replies.clear()
         self._speculative = None
         self._ambient = None
-        self._ambient_muted = False
-        self._cut = None
+        self._ambient_muted_at = None
+        self._drop_cut()
         self._held_asides = []
         self._last_backchannel = ""
         self._pending_frames = []
@@ -1185,12 +1248,19 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._end_reply_text(reply)
         self._maybe_close(reply)
 
+    @utils.log_exceptions(logger=logger)
     async def _say_task(self, reply: _Reply, text: str | AsyncIterable[str]) -> None:
-        if isinstance(text, str):
-            self._send_reply_text(reply, text)
-        else:
-            async for chunk in text:
-                self._send_reply_text(reply, chunk)
+        try:
+            if isinstance(text, str):
+                self._send_reply_text(reply, text)
+            else:
+                async for chunk in text:
+                    self._send_reply_text(reply, chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # what was written so far is still said
+            self._emit_error(e, recoverable=True)
 
         reply.llm_done = True
         self._end_reply_text(reply)
@@ -1203,14 +1273,15 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             arguments=tool_call.arguments,
             extra=tool_call.extra or {},
         )
-        if reply.sent_first and not reply.wire_stopped:
+        if reply.wire_stopped or not reply.exposed:
+            # not this reply's to run yet: the turn is not committed, or the reply was cut
+            reply.held_calls.append(call)
+            return
+
+        if reply.sent_first:
             # say what was written before the call while the tool runs
             self._send({"type": "reply.text", "reply_id": reply.id, "text": "", "flush": True})
-
-        if reply.exposed:
-            self._deliver_call(reply, call)
-        else:
-            reply.held_calls.append(call)
+        self._deliver_call(reply, call)
 
     def _send_reply_text(self, reply: _Reply, text: str) -> None:
         if not text:
@@ -1259,7 +1330,11 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         )
 
     def _insert_item(self, item: llm.ChatItem) -> None:
-        self._unacked_item_ids.add(item.id)
+        now = time.time()
+        for item_id, added_at in list(self._unacked_items.items()):
+            if now - added_at > _UNACKED_ITEM_TTL:
+                del self._unacked_items[item_id]
+        self._unacked_items[item.id] = now
         self._chat_ctx.insert(item)
 
     def _resume_cut(self) -> None:
@@ -1268,25 +1343,57 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         if cut is None or self._closing:
             return
         if time.time() - cut.created_at > _CUT_RESUME_WINDOW:
+            self._stop_writing(cut)
             return
-        self._create_task(self._resume_task(cut))
+        self._resuming = cut
+        self._resume_atask = self._create_task(self._resume_task(cut))
 
+    def _drop_cut(self) -> None:
+        """Forget the reply the caller cut: it is not picked up again."""
+        cut = self._cut
+        self._cut = None
+        if cut is not None:
+            self._stop_writing(cut)
+
+        resuming = self._resuming
+        self._resuming = None
+        if resuming is not None:
+            self._stop_writing(resuming)
+        if self._resume_atask is not None:
+            self._resume_atask.cancel()
+            self._resume_atask = None
+
+    def _stop_writing(self, cut: _Cut) -> None:
+        # the LLM kept writing in case the reply resumed
+        if cut.reply.llm_task is not None:
+            cut.reply.llm_task.cancel()
+
+    @utils.log_exceptions(logger=logger)
     async def _resume_task(self, cut: _Cut) -> None:
         llm_task = cut.reply.llm_task
         if llm_task is not None and not llm_task.done():
             # the LLM kept writing after the cut: what it adds belongs to the same reply
             await asyncio.wait([llm_task])
 
+        if self._resuming is not cut or self._closing:
+            return
+        self._resuming = None
+
         text = cut.unheard_text + cut.reply.unsent_tail
-        if not text.strip() or self._closing:
+        calls = cut.reply.held_calls
+        cut.reply.held_calls = []
+        if not text.strip() and not calls:
             return
 
         reply = self._new_reply(user_initiated=False)
         reply.resumed = True
         self._expose(reply)
         self._send_reply_text(reply, text)
+        for call in calls:
+            self._deliver_call(reply, call)
         reply.llm_done = True
         self._end_reply_text(reply)
+        self._maybe_close(reply)
 
     def _take_held_asides(self) -> None:
         held = self._held_asides
@@ -1294,6 +1401,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         for text, heard_at in held:
             self._add_user_turn(utils.shortuuid("fish_aside_"), text, heard_at)
 
+    @utils.log_exceptions(logger=logger)
     async def _release_asides_task(self) -> None:
         while self._held_asides:
             await asyncio.sleep(_ASIDE_POLL_INTERVAL)
@@ -1301,13 +1409,14 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             caller_may_commit = (
                 caller_heard_at is not None and time.time() - caller_heard_at < _CALLER_COMMIT_WAIT
             )
-            if caller_may_commit or self._reply_in_flight():
+            # a reply written for an eager turn already has these words
+            if caller_may_commit or self._reply_in_flight() or self._speculative is not None:
                 continue
             if not self._held_asides:
                 return
 
             # nothing is in the way any more: the words get an answer of their own
-            self._cut = None
+            self._drop_cut()
             self._take_held_asides()
             reply = self._new_reply(user_initiated=False)
             self._expose(reply)
@@ -1370,6 +1479,18 @@ def _audio_frame(data: bytes) -> rtc.AudioFrame:
     )
 
 
+def _to_mono(frame: rtc.AudioFrame) -> rtc.AudioFrame:
+    samples = np.frombuffer(frame.data, dtype=np.int16)
+    channels = samples.reshape(-1, frame.num_channels)
+    mono = channels.mean(axis=1).astype(np.int16)
+    return rtc.AudioFrame(
+        data=mono.tobytes(),
+        sample_rate=frame.sample_rate,
+        num_channels=NUM_CHANNELS,
+        samples_per_channel=len(mono),
+    )
+
+
 def _fade_out(data: bytes) -> bytes:
     """The start of ``data``, faded to silence."""
     samples = np.frombuffer(data, dtype=np.int16)
@@ -1389,7 +1510,7 @@ def _split_utf8(text: str, max_bytes: int) -> list[str]:
     piece_bytes = 0
     for char in text:
         char_bytes = len(char.encode("utf-8"))
-        if piece_bytes + char_bytes > max_bytes:
+        if piece and piece_bytes + char_bytes > max_bytes:
             pieces.append(piece)
             piece = ""
             piece_bytes = 0
