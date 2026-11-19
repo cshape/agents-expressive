@@ -73,6 +73,7 @@ _HAS_WORDS = re.compile(r"\w")
 class _RealtimeOptions:
     voice: NotGivenOr[str]
     own_speech: OwnSpeech
+    backchannel_strength: NotGivenOr[int]
     eager_turns: bool
     answer_asides: bool
     noise_cancellation: bool
@@ -149,6 +150,7 @@ class RealtimeModel(llm.RealtimeModel):
         llm: llm.LLM | str,
         voice: NotGivenOr[str] = NOT_GIVEN,
         own_speech: OwnSpeech = "natural",
+        backchannel_strength: NotGivenOr[int] = NOT_GIVEN,
         eager_turns: bool = True,
         answer_asides: bool = False,
         noise_cancellation: bool = True,
@@ -179,6 +181,9 @@ class RealtimeModel(llm.RealtimeModel):
             own_speech (OwnSpeech): ``"natural"`` lets the voice add its own backchannels
                 and breaths between replies; ``"quiet"`` turns them off. Defaults to
                 ``"natural"``.
+            backchannel_strength (NotGivenOr[int]): How readily the voice backchannels,
+                from 1 to 10. Lower values make it backchannel less often. Uses Fish
+                Audio's default if unset.
             eager_turns (bool): Start the LLM as soon as the user pauses, before Fish Audio
                 confirms the turn has ended. Tool calls still wait for the confirmation.
                 Defaults to True.
@@ -210,11 +215,15 @@ class RealtimeModel(llm.RealtimeModel):
                 "FISH_API_KEY environment variable"
             )
 
+        if is_given(backchannel_strength) and not 1 <= backchannel_strength <= 10:
+            raise ValueError("backchannel_strength must be an integer from 1 to 10")
+
         self._owns_llm = isinstance(llm, str)
         self._llm = _resolve_llm(llm)
         self._opts = _RealtimeOptions(
             voice=voice,
             own_speech=own_speech,
+            backchannel_strength=backchannel_strength,
             eager_turns=eager_turns,
             answer_asides=answer_asides,
             noise_cancellation=noise_cancellation,
@@ -654,6 +663,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             "own_speech": self._opts.own_speech,
             "playback": {"delay_ms": self._opts.playback_delay_ms},
         }
+        if is_given(self._opts.backchannel_strength):
+            frame["backchannel"] = {"strength": self._opts.backchannel_strength}
         if is_given(self._opts.voice):
             frame["voice"] = {"reference_id": self._opts.voice}
         return frame

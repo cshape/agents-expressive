@@ -695,6 +695,20 @@ async def test_session_start_frame(make_harness):
     assert frame["turns"]["eager"] is False
     assert frame["turns"]["speech_started"] is True
     assert frame["own_speech"] == "quiet"
+    assert "backchannel" not in frame
+
+
+async def test_session_start_frame_carries_backchannel_strength(make_harness):
+    harness = make_harness(backchannel_strength=2)
+
+    frame = harness.session._session_start_frame()
+
+    assert frame["backchannel"] == {"strength": 2}
+
+
+def test_backchannel_strength_out_of_range_is_rejected():
+    with pytest.raises(ValueError):
+        RealtimeModel(llm=FakeLLM(), api_key="test", backchannel_strength=11)
 
 
 async def test_reply_written_before_the_session_starts_is_sent_once_it_does(make_harness):
