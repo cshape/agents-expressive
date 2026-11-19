@@ -411,8 +411,28 @@ async def test_generate_reply_answers_a_tool_result(make_harness):
 # ---------------------------------------------------------------------------
 
 
-async def test_aside_over_a_reply_is_answered_after_it(make_harness):
+async def test_aside_is_not_answered(make_harness):
     harness = make_harness(_response(_QUESTION, _ANSWER), _response("Is it far?", "Not far."))
+
+    harness.eager()
+    await _settle()
+    reply_id = harness.frames()[0]["reply_id"]
+    harness.committed()
+    harness.event("reply.started", reply_id=reply_id, at_ms=1000)
+
+    # the agent's own voice coming back through a speakerphone is heard like this
+    harness.committed("Is it far?", approved_eager_id=None, turn_id="t1", kind="aside")
+    harness.done(reply_id, _ANSWER)
+    await asyncio.sleep(5)
+
+    assert harness.frames() == []
+    assert len(harness.generations) == 1
+
+
+async def test_aside_over_a_reply_is_answered_after_it_when_asked_for(make_harness):
+    harness = make_harness(
+        _response(_QUESTION, _ANSWER), _response("Is it far?", "Not far."), answer_asides=True
+    )
 
     harness.eager()
     await _settle()
@@ -480,6 +500,18 @@ async def test_reply_audio_ends_with_its_speech(make_harness):
     # a cushion of silence, the speech with its pause, then only a little of the silence
     # after it: the rest would keep the playout busy for nothing
     assert durations == [200, 40, 40, 40, 100, 100, 100]
+
+
+async def test_voice_sound_before_a_reply_is_not_played_after_it(make_harness):
+    harness = make_harness(FakeLLMResponse(input="Greet.", content="Hi.", ttft=1.0, duration=1.0))
+
+    # the reply is asked for but not written yet when the voice makes a sound of its own
+    await harness.session.generate_reply(instructions="Greet.")
+    harness.session._on_audio(_sound(40))
+
+    # generations play one after another: the sound would be heard after the greeting
+    assert len(harness.generations) == 1
+    await asyncio.sleep(5)
 
 
 async def test_voice_sound_between_replies_is_played(make_harness):

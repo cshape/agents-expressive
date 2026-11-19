@@ -74,6 +74,7 @@ class _RealtimeOptions:
     voice: NotGivenOr[str]
     own_speech: OwnSpeech
     eager_turns: bool
+    answer_asides: bool
     noise_cancellation: bool
     playback_delay_ms: int
     text_rules: bool
@@ -149,6 +150,7 @@ class RealtimeModel(llm.RealtimeModel):
         voice: NotGivenOr[str] = NOT_GIVEN,
         own_speech: OwnSpeech = "natural",
         eager_turns: bool = True,
+        answer_asides: bool = False,
         noise_cancellation: bool = True,
         playback_delay_ms: int = 300,
         text_rules: bool = True,
@@ -180,6 +182,11 @@ class RealtimeModel(llm.RealtimeModel):
             eager_turns (bool): Start the LLM as soon as the user pauses, before Fish Audio
                 confirms the turn has ended. Tool calls still wait for the confirmation.
                 Defaults to True.
+            answer_asides (bool): Fish Audio marks speech it judges was not meant for the
+                agent as an aside, and never lets it interrupt. With this on, an aside said
+                over a reply is still answered once the reply has ended, for a user who
+                talked over the agent. Leave it off where the agent can hear itself, such
+                as on a speakerphone. Defaults to False.
             noise_cancellation (bool): Denoise the user's audio before Fish Audio listens
                 to it. Defaults to True.
             playback_delay_ms (int): Delay between Fish Audio sending audio and the user
@@ -209,6 +216,7 @@ class RealtimeModel(llm.RealtimeModel):
             voice=voice,
             own_speech=own_speech,
             eager_turns=eager_turns,
+            answer_asides=answer_asides,
             noise_cancellation=noise_cancellation,
             playback_delay_ms=playback_delay_ms,
             text_rules=text_rules,
@@ -721,6 +729,11 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             return
 
         ambient = self._ambient
+        if self._reply_in_flight():
+            # a reply is on its way and plays first; the sound would come out after it
+            self._close_ambient()
+            return
+
         if self._ambient_muted():
             # a generation plays one after another, and the tool call is behind this one
             if ambient is not None:
@@ -933,7 +946,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         backchannel = text == self._last_backchannel
         self._last_backchannel = ""
 
-        if (over_reply or self._held_asides) and _HAS_WORDS.search(text) and not backchannel:
+        answerable = self._opts.answer_asides and _HAS_WORDS.search(text) and not backchannel
+        if (over_reply or self._held_asides) and answerable:
             # said over a reply, it may be the user talking over the agent without Fish
             # Audio taking it for a turn: the LLM gets the words once the reply has ended
             self._held_asides.append((text, time.time()))
