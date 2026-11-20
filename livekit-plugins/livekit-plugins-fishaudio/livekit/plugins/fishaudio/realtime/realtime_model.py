@@ -56,6 +56,8 @@ _MAX_PAUSE_MS = 300
 _AMBIENT_MUTE_TIMEOUT = 5.0
 # The framework records a turn within moments; until then a context update may lack it.
 _UNACKED_ITEM_TTL = 5.0
+# a connection that lasted this long worked, so the next loss starts a fresh set of retries
+_STABLE_CONNECTION_S = 5.0
 # Sound that has to make way for a tool call fades out over this long.
 _FADE_OUT_MS = 30
 # A reply the caller cut can be picked up again this long after it stopped.
@@ -120,6 +122,8 @@ class _Reply:
     """How much of the heard text the framework has been given."""
     has_audio: bool = False
     first_audio_at: float | None = None
+    first_call_id: str | None = None
+    """The reply's first tool call that went to the framework."""
     silence_ms: float = 0.0
     """Silence forwarded since the last sound."""
     held_calls: list[llm.FunctionCall] = field(default_factory=list)
@@ -316,6 +320,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._was_connected = False
         self._reconnecting = False
         self._retries = 0
+        self._session_started_at = 0.0
         # the connection could not be restored; nothing more can be said
         self._failed = False
         self._closing = False
@@ -370,6 +375,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
 
     async def update_instructions(self, instructions: str) -> None:
         self._instructions = instructions
+        # a reply being written for an uncommitted turn used the old instructions
+        self._cancel_speculative()
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         incoming = chat_ctx.copy(
@@ -383,6 +390,17 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         for item in incoming.items:
             incoming_ids.add(item.id)
 
+        # a reply being written for an uncommitted turn used the old context
+        self._cancel_speculative()
+
+        # the newest item the framework is known to have: an update without it replaces
+        # the conversation, as on a handoff, and nothing of the old one is kept
+        last_acked: llm.ChatItem | None = None
+        for item in self._chat_ctx.items:
+            if item.id not in self._unacked_items:
+                last_acked = item
+        continues = last_acked is None or last_acked.id in incoming_ids
+
         # the framework records a turn a moment after it happens, which can be after this
         # update was built: what this session added just now stays
         now = time.time()
@@ -391,7 +409,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             added_at = self._unacked_items.get(item.id)
             if added_at is None:
                 continue
-            if item.id in incoming_ids or now - added_at > _UNACKED_ITEM_TTL:
+            expired = now - added_at > _UNACKED_ITEM_TTL
+            if item.id in incoming_ids or expired or not continues:
                 del self._unacked_items[item.id]
                 continue
             kept.append(item)
@@ -402,6 +421,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
 
     async def update_tools(self, tools: list[llm.Tool]) -> None:
         self._tools = llm.ToolContext(tools)
+        self._cancel_speculative()
 
     def update_options(self, *, tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN) -> None:
         if is_given(tool_choice):
@@ -499,10 +519,13 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             try:
                 await self._run_connection()
             except Exception as e:
+                if self._was_connected:
+                    lasted = time.time() - self._session_started_at
+                    if lasted >= _STABLE_CONNECTION_S:
+                        # a session Fish Audio ends as soon as it starts does not count
+                        self._retries = 0
                 retryable = not isinstance(e, APIError) or e.retryable
                 recoverable = retryable and self._retries < conn_options.max_retry
-                self._emit_error(e, recoverable=recoverable)
-
                 if self._was_connected:
                     # replies in flight died with the connection; the conversation itself
                     # is ours, so the next connection carries on from it
@@ -510,6 +533,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
                     self._reconnecting = True
                     self._reset_replies("the connection to Fish Audio was lost")
 
+                self._emit_error(e, recoverable=recoverable)
                 if not recoverable:
                     self._failed = True
                     self._reset_replies("the connection to Fish Audio failed")
@@ -820,7 +844,6 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             self._ambient_muted_at = None
             self.emit("input_speech_started", llm.InputSpeechStartedEvent())
         elif event_type == "turn.speech_ended":
-            self._turn_started_at.pop(str(event.get("turn_id")), None)
             self.emit(
                 "input_speech_stopped",
                 llm.InputSpeechStoppedEvent(user_transcription_enabled=True),
@@ -855,7 +878,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._max_text_bytes = int(limits.get("max_text_bytes") or _DEFAULT_MAX_TEXT_BYTES)
         self._connected = True
         self._was_connected = True
-        self._retries = 0
+        self._session_started_at = time.time()
         # what the caller said while there was no session is not said to this one
         self._input_buf.clear()
         if self._reconnecting:
@@ -874,6 +897,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             self._emit_error(APIError(f"Fish Audio error: {self._last_error}"), recoverable=True)
             return
         # the server closes the session next, and the close is what gets reported
+        logger.error("Fish Audio ended the session", extra={"error": self._last_error})
 
     def _item_id(self, turn_id: str) -> str:
         return f"fish_{self._conn_tag}_{turn_id}"
@@ -916,6 +940,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
     def _on_turn_committed(self, event: dict[str, Any]) -> None:
         turn_id = str(event.get("turn_id") or "")
         text = str(event.get("text") or "").strip()
+        started_at = self._turn_started_at.pop(turn_id, None)
         self._caller_heard_at = None
         if not text:
             # nothing was said after all, as with a dropped turn
@@ -934,7 +959,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             if reply.exposed and not reply.done and not reply.ambient:
                 self._cancel_reply(reply)
         self._take_held_asides()
-        self._add_user_turn(self._item_id(turn_id), text, self._turn_started_at.pop(turn_id, None))
+        self._add_user_turn(self._item_id(turn_id), text, started_at)
 
         speculative = self._speculative
         approved = event.get("approved_eager_id")
@@ -969,6 +994,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._resume_cut()
 
     def _on_turn_dropped(self, event: dict[str, Any]) -> None:
+        self._turn_started_at.pop(str(event.get("turn_id") or ""), None)
         self._caller_heard_at = None
         # the sound was not a turn: nothing answers it, and a reply it stopped carries on
         self._cancel_speculative()
@@ -1019,7 +1045,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
                 created_at=reply.first_audio_at or time.time(),
                 interrupted=status == "interrupted",
             )
-            self._insert_item(message)
+            self._insert_message(reply, message)
 
         if status == "failed":
             logger.warning(
@@ -1030,6 +1056,9 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         cut_by_caller = status == "interrupted" and event.get("by") == "caller"
         stopped_early = status == "partial"
         if (cut_by_caller or stopped_early) and reply.exposed and not reply.cancelled:
+            previous = self._cut
+            if previous is not None:
+                self._stop_writing(previous)
             self._cut = _Cut(reply=reply, unheard_text=unheard_text, created_at=time.time())
             if stopped_early:
                 # Fish Audio stopped by itself, so nothing is coming that would resume it
@@ -1118,6 +1147,10 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
             return
         # a call written for an eager turn is placed after the turn that committed it
         call.created_at = time.time()
+        # the call belongs to the same assistant turn as what the reply says
+        call.group_id = reply.message_id
+        if reply.first_call_id is None:
+            reply.first_call_id = call.id
         self._insert_item(call)
         reply.function_ch.send_nowait(call)
         if not reply.sent_first:
@@ -1362,6 +1395,23 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         self._unacked_items[item.id] = now
         self._chat_ctx.insert(item)
 
+    def _insert_message(self, reply: _Reply, message: llm.ChatMessage) -> None:
+        first_call: llm.FunctionCall | None = None
+        if reply.first_call_id is not None:
+            found = self._chat_ctx.get_by_id(reply.first_call_id)
+            if isinstance(found, llm.FunctionCall):
+                first_call = found
+        if first_call is None:
+            self._insert_item(message)
+            return
+
+        # the reply spoke and then called a tool: its words come before the call, though
+        # their audio started after it
+        message.created_at = min(message.created_at, first_call.created_at)
+        self._unacked_items[message.id] = time.time()
+        index = self._chat_ctx.items.index(first_call)
+        self._chat_ctx.items.insert(index, message)
+
     def _resume_cut(self) -> None:
         cut = self._cut
         self._cut = None
@@ -1370,6 +1420,11 @@ class RealtimeSession(llm.RealtimeSession[Literal["fishaudio_server_event_receiv
         if time.time() - cut.created_at > _CUT_RESUME_WINDOW:
             self._stop_writing(cut)
             return
+        previous = self._resuming
+        if previous is not None:
+            self._stop_writing(previous)
+        if self._resume_atask is not None:
+            self._resume_atask.cancel()
         self._resuming = cut
         self._resume_atask = self._create_task(self._resume_task(cut))
 

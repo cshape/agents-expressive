@@ -172,6 +172,24 @@ async def test_committed_turn_hands_the_reply_to_the_framework(make_harness):
     assert chat_ctx.items[-1].id == harness.transcripts[-1].item_id
 
 
+async def test_user_turn_carries_when_the_user_started_speaking(make_harness):
+    harness = make_harness(_response(_QUESTION, _ANSWER))
+
+    harness.event("turn.speech_started", turn_id="t0")
+    started_at = harness.session._turn_started_at["t0"]
+    await asyncio.sleep(2)
+    harness.event("turn.speech_ended", turn_id="t0")
+    await asyncio.sleep(1)
+    harness.committed(approved_eager_id=None)
+
+    final = harness.transcripts[-1]
+    assert final.is_final is True
+    assert final.turn_started_at == started_at
+    assert harness.session.chat_ctx.items[0].created_at == started_at
+    assert harness.session._turn_started_at == {}
+    await harness.session.aclose()
+
+
 async def test_resumed_turn_cancels_the_held_reply(make_harness):
     harness = make_harness(_response(_QUESTION, _ANSWER))
 
@@ -258,6 +276,30 @@ async def test_reply_cut_by_noise_is_picked_up_again(make_harness):
     assert _reply_text(frames) == _UNHEARD
     assert frames[0]["reply_id"] != reply_id
     assert len(harness.generations) == 2
+
+
+async def test_second_cut_stops_the_first_reply_being_written(make_harness):
+    slow = FakeLLMResponse(input=_QUESTION, content=_ANSWER, ttft=0.0, duration=30.0)
+    harness = make_harness(slow)
+
+    harness.committed(approved_eager_id=None)
+    await _settle()
+    first_id = harness.frames()[0]["reply_id"]
+    first = harness.session._replies[first_id]
+    harness.done(first_id, "We open", " at nine.", status="interrupted", by="caller")
+    assert first.llm_task is not None
+    assert not first.llm_task.done()
+
+    harness.session.say("One more thing.")
+    await _settle()
+    second_id = harness.frames()[0]["reply_id"]
+    harness.done(second_id, "One more", " thing.", status="interrupted", by="caller")
+    await _settle()
+
+    # only the newest cut can be picked up again
+    assert first.llm_task.cancelled()
+    assert harness.session._cut is not None
+    assert harness.session._cut.reply.id == second_id
 
 
 async def test_reply_cut_by_a_real_turn_is_not_picked_up_again(make_harness):
@@ -384,6 +426,56 @@ async def test_tool_call_of_a_resumed_turn_never_runs(make_harness):
 
     assert harness.generations == []
     assert harness.session.chat_ctx.items == []
+
+
+async def test_words_said_before_a_tool_call_come_before_it(make_harness):
+    tool_call = llm.FunctionToolCall(name="weather", arguments="{}", call_id="c1")
+    harness = make_harness(_response(_QUESTION, "Let me check.", tool_calls=[tool_call]))
+
+    harness.committed(approved_eager_id=None)
+    await _settle()
+    frames = harness.frames()
+    reply_id = frames[0]["reply_id"]
+    # the words are spoken while the tool runs
+    flushes = [frame for frame in frames if frame.get("flush")]
+    assert len(flushes) == 1
+
+    await asyncio.sleep(0.5)
+    harness.event("reply.started", reply_id=reply_id, at_ms=0)
+    harness.session._on_audio(_sound(100))
+    harness.done(reply_id, "Let me check.")
+
+    items = harness.session.chat_ctx.items
+    assert [item.type for item in items] == ["message", "message", "function_call"]
+    assert items[1].role == "assistant"
+    assert items[2].group_id == items[1].id
+
+
+async def test_held_reply_does_not_outlive_a_context_update(make_harness):
+    harness = make_harness(
+        _response(_QUESTION, "Written without the tool result."),
+    )
+
+    harness.eager()
+    await _settle()
+    held_id = harness.frames()[0]["reply_id"]
+
+    # a tool result arrives while the turn is still open
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(role="assistant", content="It is twelve degrees.")
+    await harness.session.update_chat_ctx(chat_ctx)
+
+    cancels = [frame for frame in harness.frames() if frame["type"] == "reply.cancel"]
+    assert cancels[0]["reply_id"] == held_id
+
+    harness.committed()
+    await _settle()
+
+    # the turn is answered again, from the new context
+    frames = harness.frames()
+    assert frames[0]["reply_id"] != held_id
+    assert "for" not in frames[0]
+    assert len(harness.generations) == 1
 
 
 async def test_generate_reply_answers_a_tool_result(make_harness):
@@ -654,6 +746,29 @@ async def test_update_chat_ctx_keeps_what_the_framework_has_not_seen(make_harnes
     assert [item.role for item in harness.session.chat_ctx.items] == ["user"]
 
 
+async def test_update_chat_ctx_that_replaces_the_conversation_keeps_nothing(make_harness):
+    harness = make_harness(_response(_QUESTION, _ANSWER), _response("Transfer me.", "One moment."))
+
+    harness.eager()
+    await _settle()
+    reply_id = harness.frames()[0]["reply_id"]
+    harness.committed()
+    harness.done(reply_id, _ANSWER)
+    await harness.session.update_chat_ctx(harness.session.chat_ctx)
+
+    harness.committed("Transfer me.", approved_eager_id=None, turn_id="t1")
+    await _settle()
+
+    # a handoff moments later: the next agent starts from its own context
+    fresh = llm.ChatContext.empty()
+    fresh.add_message(role="assistant", content="You are through to billing.")
+    await harness.session.update_chat_ctx(fresh)
+
+    items = harness.session.chat_ctx.items
+    assert len(items) == 1
+    assert items[0].text_content == "You are through to billing."
+
+
 async def test_update_chat_ctx_can_drop_old_turns(make_harness):
     harness = make_harness(_response(_QUESTION, _ANSWER))
 
@@ -761,7 +876,7 @@ async def test_session_survives_any_number_of_dropped_connections(monkeypatch):
         nonlocal connections
         connections += 1
         self._handle_event({"type": "session.started", "session_id": f"s{connections}"})
-        await asyncio.sleep(1)
+        await asyncio.sleep(6)
         raise APIConnectionError("Fish Audio closed the session")
 
     session = _connecting_session(monkeypatch, _run_connection)
@@ -770,7 +885,7 @@ async def test_session_survives_any_number_of_dropped_connections(monkeypatch):
     session.on("error", errors.append)
     session.on("session_reconnected", reconnects.append)
 
-    await asyncio.sleep(10)
+    await asyncio.sleep(60)
 
     # each connection worked for a while, so each drop gets a fresh set of retries
     assert connections > 4
@@ -778,6 +893,32 @@ async def test_session_survives_any_number_of_dropped_connections(monkeypatch):
         assert error.recoverable is True
     # the event follows the new session, not the loss of the old one
     assert len(reconnects) == connections - 1
+    await session.aclose()
+
+
+async def test_session_ended_as_soon_as_it_starts_is_not_retried_forever(monkeypatch):
+    connections = 0
+
+    async def _run_connection(self: RealtimeSession) -> None:
+        nonlocal connections
+        connections += 1
+        self._handle_event({"type": "session.started", "session_id": f"s{connections}"})
+        self._handle_event(
+            {"type": "error", "code": "internal", "message": "boom", "recoverable": False}
+        )
+        raise APIConnectionError("Fish Audio closed the session")
+
+    session = _connecting_session(monkeypatch, _run_connection)
+    errors: list[llm.RealtimeModelError] = []
+    session.on("error", errors.append)
+
+    await asyncio.sleep(60)
+
+    # the first attempt and its two retries
+    assert connections == 3
+    assert errors[-1].recoverable is False
+    with pytest.raises(llm.RealtimeError):
+        await session.say("Still there?")
     await session.aclose()
 
 
